@@ -1,0 +1,98 @@
+trigger: none
+pr: none
+
+# Library variable group expected:
+# - CMKSPN:
+#   - SPN_CLIENTID (secret or plain)
+#   - SPN_SECRET   (secret)
+variables:
+  - group: CMKSPN
+
+  # Set these in pipeline variables (or replace here).
+  - name: TENANT_ID
+    value: ""
+  - name: KEYVAULT_NAME
+    value: ""
+  - name: KEYVAULT_RESOURCE_GROUP
+    value: ""
+  - name: KEYVAULT_SUBSCRIPTION_ID
+    value: ""
+  - name: KEY_NAME
+    value: ""
+
+pool:
+  vmImage: ubuntu-latest
+
+stages:
+  - stage: AuditAndRemediate
+    displayName: Audit then enable CMK
+    jobs:
+      - job: RunScripts
+        displayName: Execute PowerShell scripts
+        steps:
+          - checkout: self
+
+          - task: PowerShell@2
+            displayName: Install Az modules on agent
+            inputs:
+              pwsh: true
+              targetType: inline
+              script: |
+                $ErrorActionPreference = 'Stop'
+                Set-PSRepository -Name PSGallery -InstallationPolicy Trusted
+                Install-Module Az.Accounts,Az.Storage,Az.KeyVault,Az.Resources -Scope CurrentUser -Force -AllowClobber
+
+          - task: PowerShell@2
+            displayName: Run audit and remediation scripts
+            env:
+              SPN_CLIENTID: $(SPN_CLIENTID)
+              SPN_SECRET: $(SPN_SECRET)
+              TENANT_ID: $(TENANT_ID)
+              KEYVAULT_NAME: $(KEYVAULT_NAME)
+              KEYVAULT_RESOURCE_GROUP: $(KEYVAULT_RESOURCE_GROUP)
+              KEYVAULT_SUBSCRIPTION_ID: $(KEYVAULT_SUBSCRIPTION_ID)
+              KEY_NAME: $(KEY_NAME)
+            inputs:
+              pwsh: true
+              targetType: inline
+              script: |
+                $ErrorActionPreference = 'Stop'
+                Set-StrictMode -Version Latest
+
+                if ([string]::IsNullOrWhiteSpace($env:SPN_CLIENTID) -or
+                    [string]::IsNullOrWhiteSpace($env:SPN_SECRET) -or
+                    [string]::IsNullOrWhiteSpace($env:TENANT_ID)) {
+                  throw "SPN_CLIENTID, SPN_SECRET and TENANT_ID must be provided."
+                }
+
+                if ([string]::IsNullOrWhiteSpace($env:KEYVAULT_NAME) -or
+                    [string]::IsNullOrWhiteSpace($env:KEYVAULT_RESOURCE_GROUP) -or
+                    [string]::IsNullOrWhiteSpace($env:KEYVAULT_SUBSCRIPTION_ID) -or
+                    [string]::IsNullOrWhiteSpace($env:KEY_NAME)) {
+                  throw "KEYVAULT_NAME, KEYVAULT_RESOURCE_GROUP, KEYVAULT_SUBSCRIPTION_ID and KEY_NAME must be provided."
+                }
+
+                # Non-interactive login with SPN credentials from library group.
+                $secureSecret = ConvertTo-SecureString $env:SPN_SECRET -AsPlainText -Force
+                $credential = New-Object System.Management.Automation.PSCredential($env:SPN_CLIENTID, $secureSecret)
+                Connect-AzAccount -ServicePrincipal -Tenant $env:TENANT_ID -Credential $credential -ErrorAction Stop | Out-Null
+
+                # 1) Run audit and produce a deterministic CSV for this run.
+                $auditCsv = "$(Build.ArtifactStagingDirectory)/NonCompliant_StorageAccounts.csv"
+                ./Get-NonCompliantStorageAccounts.ps1 -OutputCsvPath $auditCsv
+
+                # 2) Run remediation from audit CSV (force to avoid interactive prompt).
+                ./Set-CMKEncryptionOnStorageAccounts.ps1 `
+                  -KeyVaultName $env:KEYVAULT_NAME `
+                  -KeyVaultResourceGroup $env:KEYVAULT_RESOURCE_GROUP `
+                  -KeyVaultSubscriptionId $env:KEYVAULT_SUBSCRIPTION_ID `
+                  -KeyName $env:KEY_NAME `
+                  -AuditCsvPath $auditCsv `
+                  -Force
+
+          - task: PublishBuildArtifacts@1
+            displayName: Publish CSV reports
+            inputs:
+              PathtoPublish: $(Build.ArtifactStagingDirectory)
+              ArtifactName: cmk-reports
+              publishLocation: Container
