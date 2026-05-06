@@ -4,8 +4,10 @@
 
 .DESCRIPTION
     This script connects to Azure (if needed), loops through selected subscriptions,
-    retrieves Cosmos DB accounts, and displays the result in a table.
-    It includes the DisableLocalAuth property to help identify local-auth status.
+    retrieves Cosmos DB accounts, and displays the result in a colored table.
+    DisableLocalAuth = True  → Green  (local auth is disabled — more secure)
+    DisableLocalAuth = False → Red    (local auth is enabled  — less secure)
+    DisableLocalAuth = $null → Yellow (property not returned  — treat as unknown)
 
 .PARAMETER SubscriptionIds
     Optional list of subscription IDs. If not provided, all accessible subscriptions
@@ -14,19 +16,15 @@
 .EXAMPLE
     .\CosmosDB_LocalAuthDisabled.ps1
 
-    Scans all subscriptions available to the current user context.
-
 .EXAMPLE
     .\CosmosDB_LocalAuthDisabled.ps1 -SubscriptionIds "sub-id-1","sub-id-2"
-
-    Scans only the specified subscriptions.
 #>
 
 param(
     [string[]]$SubscriptionIds
 )
 
-# Ensure user is authenticated before querying subscriptions/resources.
+# ── Step 1: Ensure authenticated ────────────────────────────────────────────
 if (-not (Get-AzContext)) {
     Write-Host "[Step 1/5] No Azure context found. Signing in..." -ForegroundColor Cyan
     Connect-AzAccount | Out-Null
@@ -36,12 +34,12 @@ else {
     Write-Host "[Step 1/5] Azure context already available." -ForegroundColor Green
 }
 
-# Determine which subscriptions to process.
+# ── Step 2: Resolve subscriptions ───────────────────────────────────────────
 Write-Host "[Step 2/5] Resolving subscriptions..." -ForegroundColor Cyan
 if ($SubscriptionIds -and $SubscriptionIds.Count -gt 0) {
     Write-Host "Using user-provided subscription IDs." -ForegroundColor DarkCyan
-    $subscriptions = foreach ($subscriptionId in $SubscriptionIds) {
-        Get-AzSubscription -SubscriptionId $subscriptionId -ErrorAction SilentlyContinue
+    $subscriptions = foreach ($id in $SubscriptionIds) {
+        Get-AzSubscription -SubscriptionId $id -ErrorAction SilentlyContinue
     }
 }
 else {
@@ -57,30 +55,42 @@ if (-not $subscriptions) {
 Write-Host "[Step 2/5] Found $($subscriptions.Count) subscription(s) to scan." -ForegroundColor Green
 Write-Host "[Step 3/5] Starting Cosmos DB discovery per subscription..." -ForegroundColor Cyan
 
-# Collect Cosmos DB account details from each subscription.
+# ── Step 3: Collect results ──────────────────────────────────────────────────
 $results = foreach ($subscription in $subscriptions) {
     try {
-        Write-Host "Switching context to: $($subscription.Name) [$($subscription.Id)]" -ForegroundColor DarkGray
+        Write-Host "  Switching to: $($subscription.Name) [$($subscription.Id)]" -ForegroundColor DarkGray
         Set-AzContext -SubscriptionId $subscription.Id -ErrorAction Stop | Out-Null
 
-        Write-Host "Querying Cosmos DB accounts in subscription: $($subscription.Name)" -ForegroundColor DarkGray
-        $cosmosAccounts = Get-AzCosmosDBAccount -ErrorAction Stop
-        Write-Host "Found $($cosmosAccounts.Count) Cosmos DB account(s) in $($subscription.Name)." -ForegroundColor Gray
+        $resourceGroups = Get-AzResourceGroup -ErrorAction Stop
+        Write-Host "  Found $($resourceGroups.Count) resource group(s) in $($subscription.Name)." -ForegroundColor Gray
 
-        foreach ($account in $cosmosAccounts) {
-            [PSCustomObject]@{
-                SubscriptionName = $subscription.Name
-                SubscriptionId   = $subscription.Id
-                ResourceGroup    = $account.ResourceGroupName
-                CosmosAccount    = $account.Name
-                Location         = $account.Location
-                Kind             = $account.Kind
-                DisableLocalAuth = $account.DisableLocalAuth
+        foreach ($rg in $resourceGroups) {
+            try {
+                $cosmosAccounts = Get-AzCosmosDBAccount -ResourceGroupName $rg.ResourceGroupName -ErrorAction Stop
+
+                if ($cosmosAccounts.Count -gt 0) {
+                    Write-Host "  [$($rg.ResourceGroupName)] Found $($cosmosAccounts.Count) Cosmos DB account(s)." -ForegroundColor Gray
+                }
+
+                foreach ($account in $cosmosAccounts) {
+                    [PSCustomObject]@{
+                        SubscriptionName = $subscription.Name
+                        SubscriptionId   = $subscription.Id
+                        ResourceGroup    = $rg.ResourceGroupName
+                        CosmosAccount    = $account.Name
+                        Location         = $account.Location
+                        Kind             = $account.Kind
+                        DisableLocalAuth = $account.DisableLocalAuth
+                    }
+                }
+            }
+            catch {
+                Write-Warning "  Skipping RG [$($rg.ResourceGroupName)]: $($_.Exception.Message)"
             }
         }
     }
     catch {
-        Write-Warning "Failed in subscription [$($subscription.Name)] ($($subscription.Id)): $($_.Exception.Message)"
+        Write-Warning "Failed in [$($subscription.Name)] ($($subscription.Id)): $($_.Exception.Message)"
     }
 }
 
@@ -89,32 +99,62 @@ if (-not $results) {
     return
 }
 
-Write-Host "[Step 4/5] Discovery completed. Preparing output table..." -ForegroundColor Cyan
-$results |
-    Sort-Object SubscriptionName, ResourceGroup, CosmosAccount |
-    Format-Table -AutoSize
+# ── Step 4: Colored table output ─────────────────────────────────────────────
+Write-Host "`n[Step 4/5] Discovery completed. Displaying results...`n" -ForegroundColor Cyan
 
-Write-Host "[Step 5/5] Done. Total Cosmos DB accounts listed: $($results.Count)" -ForegroundColor Green
+# Calculate column widths dynamically from the data (with minimums matching headers).
+$colWidths = @{
+    SubscriptionName = [Math]::Max(16, ($results | ForEach-Object { $_.SubscriptionName.Length } | Measure-Object -Maximum).Maximum)
+    ResourceGroup    = [Math]::Max(13, ($results | ForEach-Object { $_.ResourceGroup.Length    } | Measure-Object -Maximum).Maximum)
+    CosmosAccount    = [Math]::Max(12, ($results | ForEach-Object { $_.CosmosAccount.Length    } | Measure-Object -Maximum).Maximum)
+    Location         = [Math]::Max(8,  ($results | ForEach-Object { $_.Location.Length         } | Measure-Object -Maximum).Maximum)
+    Kind             = [Math]::Max(4,  ($results | ForEach-Object { $_.Kind.Length             } | Measure-Object -Maximum).Maximum)
+    DisableLocalAuth = 15  # fixed — value is always True/False/Unknown
+}
 
+# Header
+$header = "{0,-$($colWidths.SubscriptionName)}  {1,-$($colWidths.ResourceGroup)}  {2,-$($colWidths.CosmosAccount)}  {3,-$($colWidths.Location)}  {4,-$($colWidths.Kind)}  {5,-$($colWidths.DisableLocalAuth)}" `
+    -f "SubscriptionName", "ResourceGroup", "CosmosAccount", "Location", "Kind", "DisableLocalAuth"
 
+$separator = "-" * $header.Length
 
+Write-Host $header   -ForegroundColor White
+Write-Host $separator -ForegroundColor DarkGray
 
+# Rows — color the entire row based on DisableLocalAuth
+$sorted = $results | Sort-Object SubscriptionName, ResourceGroup, CosmosAccount
 
+foreach ($row in $sorted) {
 
+    # Determine display value and row color
+    if ($null -eq $row.DisableLocalAuth) {
+        $authDisplay = "Unknown"
+        $rowColor    = "Yellow"   # unknown / not returned by API
+    }
+    elseif ($row.DisableLocalAuth -eq $true) {
+        $authDisplay = "True"
+        $rowColor    = "Green"    # local auth disabled → secure ✓
+    }
+    else {
+        $authDisplay = "False"
+        $rowColor    = "Red"      # local auth enabled  → insecure ✗
+    }
 
+    $line = "{0,-$($colWidths.SubscriptionName)}  {1,-$($colWidths.ResourceGroup)}  {2,-$($colWidths.CosmosAccount)}  {3,-$($colWidths.Location)}  {4,-$($colWidths.Kind)}  {5,-$($colWidths.DisableLocalAuth)}" `
+        -f $row.SubscriptionName, $row.ResourceGroup, $row.CosmosAccount,
+           $row.Location, $row.Kind, $authDisplay
 
+    Write-Host $line -ForegroundColor $rowColor
+}
 
+Write-Host $separator -ForegroundColor DarkGray
 
+# ── Step 5: Summary ──────────────────────────────────────────────────────────
+$secureCount   = ($results | Where-Object { $_.DisableLocalAuth -eq $true  }).Count
+$insecureCount = ($results | Where-Object { $_.DisableLocalAuth -eq $false }).Count
+$unknownCount  = ($results | Where-Object { $null -eq $_.DisableLocalAuth  }).Count
 
-
-
-
-
-
-
-
-
-
-
-
-
+Write-Host "`n[Step 5/5] Done. Total accounts: $($results.Count)" -ForegroundColor Cyan
+Write-Host "  Secure   (DisableLocalAuth = True) : $secureCount"   -ForegroundColor Green
+Write-Host "  Insecure (DisableLocalAuth = False): $insecureCount"  -ForegroundColor Red
+Write-Host "  Unknown  (property not returned)   : $unknownCount"   -ForegroundColor Yellow
