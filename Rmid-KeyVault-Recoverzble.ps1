@@ -16,6 +16,14 @@
     Permissions : Contributor or Key Vault Contributor on each target subscription
 #>
 
+
+
+Get-AzKeyVault | ForEach-Object {
+    Get-AzKeyVault -VaultName $_.VaultName
+} | Where-Object {
+    $_.EnablePurgeProtection -ne $true
+} | Select-Object VaultName, ResourceGroupName, Location, EnableSoftDelete, EnablePurgeProtection
+           
 [CmdletBinding(SupportsShouldProcess = $true)]
 param()
 
